@@ -16,6 +16,7 @@ import models
 import tools
 import envs.wrappers as wrappers
 from parallel import Parallel, Damy
+from rl_envs import VecEnv
 
 import torch
 from torch import nn
@@ -241,10 +242,7 @@ def make_env(config, mode):
         env = wrappers.OneHotAction(env)
     elif suite == 'a1':
         # TODO: Unitree A1 locomotion environments
-        import envs.a1 as a1
-
-        env = a1.make_env(task, size=config.size)
-        env = wrappers.OneHotAction(env)
+        raise NotImplementedError('Unitree A1 locomotion environments should not be used by Parallel.')
     else:
         raise NotImplementedError(suite)
     env = wrappers.TimeLimit(env, config.time_limit)
@@ -254,173 +252,204 @@ def make_env(config, mode):
         env = wrappers.RewardObs(env)
     return env
 
+# TODO: Change main() to DreamerRunner and training part to self.learn
+# def main(config):
 
-def main(config):
-    # === 0.0 固定每次实验结果（从种子和设备两个方面）===
-    tools.set_seed_everywhere(config.seed)
-    if config.deterministic_run:
-        tools.enable_deterministic_run()
-    # === 0.1 设定log记录目录以及训练|评估评率 ===
-    # action_repeat是指将预测出的动作重复执行多少遍(想想MC)
-    logdir = pathlib.Path(config.logdir).expanduser()
-    config.traindir = config.traindir or logdir / "train_eps"
-    config.evaldir = config.evaldir or logdir / "eval_eps"
-    config.steps //= config.action_repeat
-    config.eval_every //= config.action_repeat
-    config.log_every //= config.action_repeat
-    config.time_limit //= config.action_repeat
-
-    print("Logdir", logdir)
-    logdir.mkdir(parents=True, exist_ok=True)
-    config.traindir.mkdir(parents=True, exist_ok=True)
-    config.evaldir.mkdir(parents=True, exist_ok=True)
-    step = count_steps(config.traindir)
-    # step in logger is environmental step
-    logger = tools.Logger(logdir, config.action_repeat * step)
-
-    print("Create envs.")
-    # === 1.0 加载数据集 ===
-    # 如果有offline_traindir和offline_evaldir则从这两个目录加载数据集，否则从traindir和evaldir加载
-    # TODO: 默认值下这些dir都是空的，应该去哪里加载？
-    if config.offline_traindir:
-        directory = config.offline_traindir.format(**vars(config))
-    else:
-        directory = config.traindir
-    train_eps = tools.load_episodes(directory, limit=config.dataset_size)
-    if config.offline_evaldir:
-        directory = config.offline_evaldir.format(**vars(config))
-    else:
-        directory = config.evaldir
-    eval_eps = tools.load_episodes(directory, limit=1)
-    # === 1.1 开环境 ===
-    # 有Parallel和Damy(Dummy?)两种模式，实现在parallel.py中
-    # make_env在dreamer.py中，mode in ['train','eval']
-    # config.envs为环境数量
-    # config.parallel为bool
-    make = lambda mode: make_env(config, mode)
-    train_envs = [make("train") for _ in range(config.envs)]
-    eval_envs = [make("eval") for _ in range(config.envs)]
-    if config.parallel:
-        train_envs = [Parallel(env, "process") for env in train_envs]
-        eval_envs = [Parallel(env, "process") for env in eval_envs]
-    else:
-        train_envs = [Damy(env) for env in train_envs]
-        eval_envs = [Damy(env) for env in eval_envs]
-    acts = train_envs[0].action_space
-    config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
-
-    # === 1.2 warmup,在数据集中预填充若干数据 ===
-    # simulate的功能：用给定的agent在给定的环境中采集数据，然后存到给定的目录中，要传入agent和envs
-    # random_agent是随机构造了一个agent，正式训练的时候agent是RL算法，这里是为了不干扰算法的训练
-    state = None
-    if not config.offline_traindir:
-        prefill = max(0, config.prefill - count_steps(config.traindir))
-        print(f"Prefill dataset ({prefill} steps).")
+class DreamerRunner():
+    def __init__(self,
+                 env: VecEnv,
+                 train_cfg,
+                 log_dir=None,
+                 device='cpu',
+                 history_length = 5,
+                 ):
+        self.config = train_cfg
+        # === 0.0 固定每次实验结果（从种子和设备两个方面）===
         
-        # 根据环境是否为discrete构建random_actor
-        if hasattr(acts, "discrete"):
-            random_actor = tools.OneHotDist(
-                torch.zeros(config.num_actions).repeat(config.envs, 1)
-            )
+        tools.set_seed_everywhere(self.config.seed)
+        if self.config.deterministic_run:
+            tools.enable_deterministic_run()
+        
+        # === 0.1 设定log记录目录以及训练|评估评率 ===
+        # action_repeat是指将预测出的动作重复执行多少遍(想想MC)
+        # 定义了logdir和logger等数据记录机制
+        if not log_dir:
+            self.logdir = pathlib.Path(self.config.logdir).expanduser()
         else:
-            random_actor = torchd.independent.Independent(
-                torchd.uniform.Uniform(
-                    torch.Tensor(acts.low).repeat(config.envs, 1),
-                    torch.Tensor(acts.high).repeat(config.envs, 1),
-                ),
-                1,
+            self.logdir = log_dir
+            
+        self.config.traindir = self.config.traindir or self.logdir / "train_eps"
+        self.config.evaldir = self.config.evaldir or self.logdir / "eval_eps"
+        self.config.steps //= self.config.action_repeat
+        self.config.eval_every //= self.config.action_repeat
+        self.config.log_every //= self.config.action_repeat
+        self.config.time_limit //= self.config.action_repeat
+
+        print("Logdir", self.logdir)
+        self.logdir.mkdir(parents=True, exist_ok=True)
+        self.config.traindir.mkdir(parents=True, exist_ok=True)
+        self.config.evaldir.mkdir(parents=True, exist_ok=True)
+        step = count_steps(self.config.traindir)
+        # step in logger is environmental step
+        self.logger = tools.Logger(self.logdir, self.config.action_repeat * step)
+
+        print("Create envs.")
+        # === 1.0 加载数据集 ===
+        # 如果有offline_traindir和offline_evaldir则从这两个目录加载数据集，否则从traindir和evaldir加载
+        # TODO: 如果数据集下面没有文件，等待simulate去建立文件，这里的train_eps和eval_eps应该是空的
+        if self.config.offline_traindir:
+            directory = self.config.offline_traindir.format(**vars(self.config))
+        else:
+            directory = self.config.traindir
+        self.train_eps = tools.load_episodes(directory, limit=self.config.dataset_size)
+        if self.config.offline_evaldir:
+            directory = self.config.offline_evaldir.format(**vars(self.config))
+        else:
+            directory = self.config.evaldir
+        self.eval_eps = tools.load_episodes(directory, limit=1)
+        
+        # === 1.1 开环境 ===
+        # 有Parallel和Damy(Dummy?)两种模式，实现在parallel.py中
+        # make_env在dreamer.py中，mode in ['train','eval']
+        # config.envs为环境数量
+        # config.parallel为bool
+        
+        # # Here env is implied by VecEnv, Paralleled as a single environment.
+        # make = lambda mode: make_env(self.config, mode)
+        # train_envs = [make("train") for _ in range(self.config.envs)]
+        # eval_envs = [make("eval") for _ in range(self.config.envs)]
+        # if self.config.parallel:
+        #     train_envs = [Parallel(env, "process") for env in train_envs]
+        #     eval_envs = [Parallel(env, "process") for env in eval_envs]
+        # else:
+        #     train_envs = [Damy(env) for env in train_envs]
+        #     eval_envs = [Damy(env) for env in eval_envs]
+        
+        self.train_envs = [Damy(env)]
+        self.eval_envs = [Damy(env)]
+        
+        acts = self.train_envs[0].action_space
+        self.config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
+
+        # === 1.2 warmup,在数据集中预填充若干数据 ===
+        # simulate的功能：用给定的agent在给定的环境中采集数据，然后存到给定的目录中，要传入agent和envs
+        # random_agent是随机构造了一个agent，正式训练的时候agent是RL算法，这里是为了不干扰算法的训练
+        state = None
+        if not self.config.offline_traindir:
+            prefill = max(0, self.config.prefill - count_steps(self.config.traindir))
+            print(f"Prefill dataset ({prefill} steps).")
+            
+            # 根据环境是否为discrete构建random_actor
+            if hasattr(acts, "discrete"):
+                random_actor = tools.OneHotDist(
+                    torch.zeros(self.config.num_actions).repeat(self.config.envs, 1)
+                )
+            else:
+                random_actor = torchd.independent.Independent(
+                    torchd.uniform.Uniform(
+                        torch.Tensor(acts.low).repeat(self.config.envs, 1),
+                        torch.Tensor(acts.high).repeat(self.config.envs, 1),
+                    ),
+                    1,
+                )
+
+            # 根据random_actor构建random_agent，三个参数仅为了匹配常规agent的接口，实际上输出action是随机的，logprob由对应action算得
+            def random_agent(o, d, s):
+                action = random_actor.sample()
+                logprob = random_actor.log_prob(action)
+                return {"action": action, "logprob": logprob}, None
+
+            # 会在self.train_eps中补充simulate出的数据
+            state = tools.simulate(
+                random_agent,
+                self.train_envs,
+                self.train_eps,
+                self.config.traindir,
+                self.logger,
+                limit=self.config.dataset_size,
+                steps=prefill,
             )
+            self.logger.step += prefill * self.config.action_repeat
+            print(f"Logger: ({self.logger.step} steps).")
+        
+        print("Simulate agent.")
 
-        # 根据random_actor构建random_agent，三个参数仅为了匹配常规agent的接口，实际上输出action是随机的，logprob由对应action算得
-        def random_agent(o, d, s):
-            action = random_actor.sample()
-            logprob = random_actor.log_prob(action)
-            return {"action": action, "logprob": logprob}, None
 
-        state = tools.simulate(
-            random_agent,
-            train_envs,
-            train_eps,
-            config.traindir,
-            logger,
-            limit=config.dataset_size,
-            steps=prefill,
-        )
-        logger.step += prefill * config.action_repeat
-        print(f"Logger: ({logger.step} steps).")
+    def learn(self):
+        # === 2.0 构建可以训练的智能体dreamer ===
+        train_dataset = make_dataset(self.train_eps, self.config)
+        eval_dataset = make_dataset(self.eval_eps, self.config)
+        # In Dreamer: __init__(self, obs_space, act_space, config, logger, dataset):
+        agent = Dreamer(
+            self.train_envs[0].observation_space,
+            self.train_envs[0].action_space,
+            self.config,
+            self.logger,
+            train_dataset,
+        ).to(self.config.device)
+        agent.requires_grad_(requires_grad=False)
+        
+        # 断点续传
+        if (self.logdir / "latest.pt").exists():
+            checkpoint = torch.load(self.logdir / "latest.pt")
+            agent.load_state_dict(checkpoint["agent_state_dict"])
+            tools.recursively_load_optim_state_dict(agent, checkpoint["optims_state_dict"])
+            agent._should_pretrain._once = False
 
-    # === 2.0 构建可以训练的智能体dreamer ===
-    print("Simulate agent.")
-    train_dataset = make_dataset(train_eps, config)
-    eval_dataset = make_dataset(eval_eps, config)
-    # In Dreamer: __init__(self, obs_space, act_space, config, logger, dataset):
-    agent = Dreamer(
-        train_envs[0].observation_space,
-        train_envs[0].action_space,
-        config,
-        logger,
-        train_dataset,
-    ).to(config.device)
-    agent.requires_grad_(requires_grad=False)
+        # make sure eval will be executed once after config.steps
+        # 一共训练steps步，每eval_every步进行一次评估，一定最后进行一次评估（上一行注释的含义）
+        while agent._step < self.config.steps + self.config.eval_every:
+            self.logger.write()
+            
+            # === 2.1 先进行评估 ===
+            # eval_episode_num个episode (常用值: 10)     
+            if self.config.eval_episode_num > 0:
+                print("Start evaluation.")
+                eval_policy = functools.partial(agent, training=False)
+                tools.simulate(
+                    eval_policy,
+                    self.eval_envs,
+                    self.eval_eps,
+                    self.config.evaldir,
+                    self.logger,
+                    is_eval=True,
+                    episodes=self.config.eval_episode_num,
+                )
+                if self.config.video_pred_log:
+                    video_pred = agent._wm.video_pred(next(eval_dataset))
+                    self.logger.video("eval_openl", to_np(video_pred))
+            
+            # === 2.2 再进行训练 ===
+            # 每次训练evel_every步(常用值:1e4)
+            # TODO: 传梯度在什么地方？
+            print("Start training.")
+            state = tools.simulate(
+                agent,
+                self.train_envs,
+                self.train_eps,
+                self.config.traindir,
+                self.logger,
+                limit=self.config.dataset_size,
+                steps=self.config.eval_every,
+                state=state,
+            )
+            
+            # === 2.3 保存模型 ===
+            items_to_save = {
+                "agent_state_dict": agent.state_dict(),
+                "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
+            }
+            torch.save(items_to_save, self.logdir / "latest.pt")
+        
+        self.close()
     
-    # 断点续传
-    if (logdir / "latest.pt").exists():
-        checkpoint = torch.load(logdir / "latest.pt")
-        agent.load_state_dict(checkpoint["agent_state_dict"])
-        tools.recursively_load_optim_state_dict(agent, checkpoint["optims_state_dict"])
-        agent._should_pretrain._once = False
-
-    # make sure eval will be executed once after config.steps
-    # 一共训练steps步，每eval_every步进行一次评估，一定最后进行一次评估（上一行注释的含义）
-    while agent._step < config.steps + config.eval_every:
-        logger.write()
-        
-        # === 2.1 先进行评估 ===
-        # eval_episode_num个episode (常用值: 10)     
-        if config.eval_episode_num > 0:
-            print("Start evaluation.")
-            eval_policy = functools.partial(agent, training=False)
-            tools.simulate(
-                eval_policy,
-                eval_envs,
-                eval_eps,
-                config.evaldir,
-                logger,
-                is_eval=True,
-                episodes=config.eval_episode_num,
-            )
-            if config.video_pred_log:
-                video_pred = agent._wm.video_pred(next(eval_dataset))
-                logger.video("eval_openl", to_np(video_pred))
-        
-        # === 2.2 再进行训练 ===
-        # 每次训练evel_every步(常用值:1e4)
-        # TODO: 传梯度在什么地方？
-        print("Start training.")
-        state = tools.simulate(
-            agent,
-            train_envs,
-            train_eps,
-            config.traindir,
-            logger,
-            limit=config.dataset_size,
-            steps=config.eval_every,
-            state=state,
-        )
-        
-        # === 2.3 保存模型 ===
-        items_to_save = {
-            "agent_state_dict": agent.state_dict(),
-            "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
-        }
-        torch.save(items_to_save, logdir / "latest.pt")
-        
-    # === 3.0 关闭环境 ===
-    for env in train_envs + eval_envs:
-        try:
-            env.close()
-        except Exception:
-            pass
+    def close(self):
+        # === 3.0 关闭环境 ===
+        for env in self.train_envs + self.eval_envs:
+            try:
+                env.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
@@ -452,4 +481,4 @@ if __name__ == "__main__":
         parser.add_argument(f"--{key}", type=arg_type, default=arg_type(value))
         
     # 调 用 主 函 数
-    main(parser.parse_args(remaining))
+    # main(parser.parse_args(remaining))

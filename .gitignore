@@ -5,6 +5,7 @@ dreamer_rl/vis_*
 dreamer_rl/result*
 dreamer_rl/logs*
 
+logs*
 references/
 **/__pycache__/
 **/*.pyc
