@@ -1,8 +1,13 @@
 #
-run*
-logdir*
-vis_*
-result*
+dreamer_rl/run*
+dreamer_rl/logdir*
+dreamer_rl/vis_*
+dreamer_rl/result*
+dreamer_rl/logs*
+
+references/
+**/__pycache__/
+**/*.pyc
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
