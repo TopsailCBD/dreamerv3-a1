@@ -124,7 +124,17 @@ class Logger:
         value = value.transpose(1, 4, 2, 0, 3).reshape((1, T, C, H, B * W))
         self._writer.add_video(name, value, step, 16)
 
-
+# 和环境交互返回交互信息
+# args agent: 能返回{"action":a,"log_prob":p},agent_state的函数: random_agent. 第一项也可以不是字典仅是action
+# args envs: 一个列表，包含多个环境: train_envs
+# args cache: 用于训练/评估的数据(?): train_eps
+# args directory: 存log的路径: config.traindir
+# args logger: 一个logger对象: logger
+# args is_eval: 是否是测试: False
+# args limit: 限制数据集大小: config.dataset_size
+# args steps: 限制交互次数: prefill
+# args episodes: 限制模拟轮数，和steps开一个就行: 0
+# args state: step, episode, done, length, obs, agent_state, reward
 def simulate(
     agent,
     envs,
@@ -174,6 +184,10 @@ def simulate(
         else:
             action = np.array(action)
         assert len(action) == len(envs)
+        
+        # step的返回值应该和gym.step一样，用的老版gym，只返回4个值
+        # obs, reward, done记录并存入transition，info中提取discount存入transition
+        
         # step envs
         results = [e.step(a) for e, a in zip(envs, action)]
         results = [r() for r in results]
@@ -305,7 +319,7 @@ def save_episodes(directory, episodes):
                 f2.write(f1.read())
     return True
 
-
+# 用于make_dataset
 def from_generator(generator, batch_size):
     while True:
         batch = []
@@ -319,7 +333,7 @@ def from_generator(generator, batch_size):
             data[key] = np.stack(data[key], 0)
         yield data
 
-
+# 用于make_dataset
 def sample_episodes(episodes, length, seed=0):
     np_random = np.random.RandomState(seed)
     while True:
@@ -360,7 +374,7 @@ def sample_episodes(episodes, length, seed=0):
             size = len(next(iter(ret.values())))
         yield ret
 
-
+# 用于main中加载数据集
 def load_episodes(directory, limit=None, reverse=True):
     directory = pathlib.Path(directory).expanduser()
     episodes = collections.OrderedDict()
@@ -709,7 +723,11 @@ def lambda_return(reward, value, pcont, bootstrap, lambda_, axis):
         returns = returns.permute(dims)
     return returns
 
-
+# 用于exploration.py的Plan2Explore和models.py的WorldModel._model_opt, ImagBehavior._actor_opt, ImagBehavior._value_opt
+# 是很多个优化器的定义集合，核心是self._opt，根据opt:str选择不同的优化器
+# 该类对象可以作为函数调用，参数为loss和param，返回值为记录各个metric的字典metrics。
+# 每次调用时会执行loss.backward
+# self._scaler为GradScaler类型，作用就是对损失值进行缩放，以便在低精度计算中保持梯度值的数量级适中。
 class Optimizer:
     def __init__(
         self,
@@ -784,6 +802,10 @@ def args_type(default):
     return lambda x: parse_string(x) if isinstance(x, str) else parse_object(x)
 
 
+# 循环遍历列表inputs
+# 经每个元素传给fn进行计算
+# 初始状态为start，每次迭代返回状态last
+# 返回值为outputs，outputs[i]为inputs[i]经过fn计算后的结果
 def static_scan(fn, inputs, start):
     last = start
     indices = range(inputs[0].shape[0])
@@ -967,8 +989,11 @@ def set_seed_everywhere(seed):
 
 
 def enable_deterministic_run():
+    # 配置CUDA的cuBLAS库的工作空间（workspace）。cuBLAS是一个用于矩阵乘法和其他线性代数运算的CUDA库。通过设置工作空间的大小和模式，可以影响cuBLAS的性能和内存使用。在这里，设置的值:4096:8表示工作空间的大小为4096字节，并且使用8字节对齐方式。
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    # 禁用了PyTorch中与cuDNN（CUDA深度神经网络库）相关的自动调优功能。cuDNN是一个用于深度神经网络加速的CUDA库，它可以根据硬件和数据情况自动选择最佳算法和配置来提高性能。禁用自动调优可以确保每次运行的结果一致，但可能会导致一些性能损失。
     torch.backends.cudnn.benchmark = False
+    # 启用了PyTorch中与算法的确定性相关的设置。它会在可能的情况下选择确定性的实现方式，以确保每次运行的结果一致性。这意味着对于相同的输入和模型，每次运行将得到相同的输出。启用确定性算法对于实验的可重复性和结果的验证非常重要，但可能会导致一些性能损失。
     torch.use_deterministic_algorithms(True)
 
 

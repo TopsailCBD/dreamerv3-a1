@@ -41,6 +41,7 @@ class Dreamer(nn.Module):
         self._step = logger.step // config.action_repeat
         self._update_count = 0
         self._dataset = dataset
+        # 定义world_model
         self._wm = models.WorldModel(obs_space, act_space, self._step, config)
         self._task_behavior = models.ImagBehavior(
             config, self._wm, config.behavior_stop_grad
@@ -57,6 +58,13 @@ class Dreamer(nn.Module):
             plan2explore=lambda: expl.Plan2Explore(config, self._wm, reward),
         )[config.expl_behavior]().to(self._config.device)
 
+    # 调用：一个采样的步
+    # Call: self._policy(), self._should_reset(), self._shouldtrain(), self._should_pretrain(), self._should_expl()
+    # Input: obs, state, training
+        # obs: only used in policy.
+        # state: used for policy and dynamics, more information.
+        # reset: whether the env is done.
+    # Output: policy_output, state
     def __call__(self, obs, reset, state=None, training=True):
         step = self._step
         if self._should_reset(step):
@@ -68,6 +76,8 @@ class Dreamer(nn.Module):
                     state[0][key][i] *= mask[i]
             for i in range(len(state[1])):
                 state[1][i] *= mask[i]
+        
+        # training: 要记录各种log
         if training:
             steps = (
                 self._config.pretrain
@@ -94,6 +104,8 @@ class Dreamer(nn.Module):
             self._logger.step = self._config.action_repeat * self._step
         return policy_output, state
 
+
+    # 策略：用给定的obs和state，输出policy和下一个state
     def _policy(self, obs, state, training):
         if state is None:
             batch_size = len(obs["image"])
@@ -132,6 +144,10 @@ class Dreamer(nn.Module):
         state = (latent, action)
         return policy_output, state
 
+    # 探索：用于给动作加噪声
+    # expl_amount: action的采集数量
+    # actor_dist: 是one_hot的话输出从OneHotDist中采样的结果，否则从Normal中采样
+    # TODO: OneHotDist是不是采样出来的结果是one_hot的？
     def _exploration(self, action, training):
         amount = self._config.expl_amount if training else self._config.eval_noise
         if amount == 0:
@@ -142,6 +158,8 @@ class Dreamer(nn.Module):
         else:
             return torch.clip(torchd.normal.Normal(action, amount).sample(), -1, 1)
 
+    # 训练：从world model中获取metrics并存下来
+    # TODO: 什么样的写法让self._task_behavior.train()的第二个参数是一个函数？
     def _train(self, data):
         metrics = {}
         post, context, mets = self._wm._train(data)
@@ -170,7 +188,7 @@ def make_dataset(episodes, config):
     dataset = tools.from_generator(generator, config.batch_size)
     return dataset
 
-
+# 用于main的开环境步骤
 def make_env(config, mode):
     suite, task = config.task.split("_", 1)
     if suite == "dmc":
@@ -232,9 +250,12 @@ def make_env(config, mode):
 
 
 def main(config):
+    # === 0.0 固定每次实验结果（从种子和设备两个方面）===
     tools.set_seed_everywhere(config.seed)
     if config.deterministic_run:
         tools.enable_deterministic_run()
+    # === 0.1 设定log记录目录以及训练|评估评率 ===
+    # action_repeat是指将预测出的动作重复执行多少遍(想想MC)
     logdir = pathlib.Path(config.logdir).expanduser()
     config.traindir = config.traindir or logdir / "train_eps"
     config.evaldir = config.evaldir or logdir / "eval_eps"
@@ -252,6 +273,9 @@ def main(config):
     logger = tools.Logger(logdir, config.action_repeat * step)
 
     print("Create envs.")
+    # === 1.0 加载数据集 ===
+    # 如果有offline_traindir和offline_evaldir则从这两个目录加载数据集，否则从traindir和evaldir加载
+    # TODO: 默认值下这些dir都是空的，应该去哪里加载？
     if config.offline_traindir:
         directory = config.offline_traindir.format(**vars(config))
     else:
@@ -262,6 +286,11 @@ def main(config):
     else:
         directory = config.evaldir
     eval_eps = tools.load_episodes(directory, limit=1)
+    # === 1.1 开环境 ===
+    # 有Parallel和Damy(Dummy?)两种模式，实现在parallel.py中
+    # make_env在dreamer.py中，mode in ['train','eval']
+    # config.envs为环境数量
+    # config.parallel为bool
     make = lambda mode: make_env(config, mode)
     train_envs = [make("train") for _ in range(config.envs)]
     eval_envs = [make("eval") for _ in range(config.envs)]
@@ -274,10 +303,15 @@ def main(config):
     acts = train_envs[0].action_space
     config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
 
+    # === 1.2 warmup,在数据集中预填充若干数据 ===
+    # simulate的功能：用给定的agent在给定的环境中采集数据，然后存到给定的目录中，要传入agent和envs
+    # random_agent是随机构造了一个agent，正式训练的时候agent是RL算法，这里是为了不干扰算法的训练
     state = None
     if not config.offline_traindir:
         prefill = max(0, config.prefill - count_steps(config.traindir))
         print(f"Prefill dataset ({prefill} steps).")
+        
+        # 根据环境是否为discrete构建random_actor
         if hasattr(acts, "discrete"):
             random_actor = tools.OneHotDist(
                 torch.zeros(config.num_actions).repeat(config.envs, 1)
@@ -291,6 +325,7 @@ def main(config):
                 1,
             )
 
+        # 根据random_actor构建random_agent，三个参数仅为了匹配常规agent的接口，实际上输出action是随机的，logprob由对应action算得
         def random_agent(o, d, s):
             action = random_actor.sample()
             logprob = random_actor.log_prob(action)
@@ -308,9 +343,11 @@ def main(config):
         logger.step += prefill * config.action_repeat
         print(f"Logger: ({logger.step} steps).")
 
+    # === 2.0 构建可以训练的智能体dreamer ===
     print("Simulate agent.")
     train_dataset = make_dataset(train_eps, config)
     eval_dataset = make_dataset(eval_eps, config)
+    # In Dreamer: __init__(self, obs_space, act_space, config, logger, dataset):
     agent = Dreamer(
         train_envs[0].observation_space,
         train_envs[0].action_space,
@@ -319,6 +356,8 @@ def main(config):
         train_dataset,
     ).to(config.device)
     agent.requires_grad_(requires_grad=False)
+    
+    # 断点续传
     if (logdir / "latest.pt").exists():
         checkpoint = torch.load(logdir / "latest.pt")
         agent.load_state_dict(checkpoint["agent_state_dict"])
@@ -326,8 +365,12 @@ def main(config):
         agent._should_pretrain._once = False
 
     # make sure eval will be executed once after config.steps
+    # 一共训练steps步，每eval_every步进行一次评估，一定最后进行一次评估（上一行注释的含义）
     while agent._step < config.steps + config.eval_every:
         logger.write()
+        
+        # === 2.1 先进行评估 ===
+        # eval_episode_num个episode (常用值: 10)     
         if config.eval_episode_num > 0:
             print("Start evaluation.")
             eval_policy = functools.partial(agent, training=False)
@@ -343,6 +386,10 @@ def main(config):
             if config.video_pred_log:
                 video_pred = agent._wm.video_pred(next(eval_dataset))
                 logger.video("eval_openl", to_np(video_pred))
+        
+        # === 2.2 再进行训练 ===
+        # 每次训练evel_every步(常用值:1e4)
+        # TODO: 传梯度在什么地方？
         print("Start training.")
         state = tools.simulate(
             agent,
@@ -354,11 +401,15 @@ def main(config):
             steps=config.eval_every,
             state=state,
         )
+        
+        # === 2.3 保存模型 ===
         items_to_save = {
             "agent_state_dict": agent.state_dict(),
             "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
         }
         torch.save(items_to_save, logdir / "latest.pt")
+        
+    # === 3.0 关闭环境 ===
     for env in train_envs + eval_envs:
         try:
             env.close()
@@ -374,6 +425,7 @@ if __name__ == "__main__":
         (pathlib.Path(sys.argv[0]).parent / "configs.yaml").read_text()
     )
 
+    # 把update按层级结构赋值给base，让base变成字典套字典
     def recursive_update(base, update):
         for key, value in update.items():
             if isinstance(value, dict) and key in base:
@@ -381,6 +433,9 @@ if __name__ == "__main__":
             else:
                 base[key] = value
 
+    # 解析命令行传入的参数和configs.yaml中的参数，将其合并到defaults中
+    # 这段代码以后要好好学一学，每次都可以用
+    # TODO: args.configs是什么？是命令行传入的参数吗？
     name_list = ["defaults", *args.configs] if args.configs else ["defaults"]
     defaults = {}
     for name in name_list:
@@ -389,4 +444,6 @@ if __name__ == "__main__":
     for key, value in sorted(defaults.items(), key=lambda x: x[0]):
         arg_type = tools.args_type(value)
         parser.add_argument(f"--{key}", type=arg_type, default=arg_type(value))
+        
+    # 调 用 主 函 数
     main(parser.parse_args(remaining))

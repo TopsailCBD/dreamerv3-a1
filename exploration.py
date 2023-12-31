@@ -6,6 +6,7 @@ import models
 import networks
 import tools
 
+# exploration.py定义了Random和Plan2Explore两个类，分别对应随机策略和Plan2Explore策略。
 
 class Random(nn.Module):
     def __init__(self, config, act_space):

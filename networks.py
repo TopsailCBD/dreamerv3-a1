@@ -9,6 +9,17 @@ from torch import distributions as torchd
 
 import tools
 
+# networks.py定义了RSSM, MultiEncoder, MultiDecoder, ConvEncoder, ConvDecoder, MLP, ActionHead, GRUCell, ChLayerNorm, Conv2dSame这些网络
+# RSSM: Recurrent State Space Model, 用于WorldModel.dynamics
+# MultiEncoder: 用于WorldModel.encoder
+# MultiDecoder: 用于WorldModel.heads["decoder"]，输出重构的图像的那个
+# ConvEncoder: 用于MultiEncoder.cnn_encoder, 需要MultiEncoder.cnn_shapes参数
+# ConvDecoder: 用于MultiDecoder.cnn_decoder, 需要MultiDecoder.cnn_shapes参数
+# MLP: 用于MultiEncoder.mlp_encoder, MultiDecoder.mlp_decoder, 需要MultiEncoder.mlp_shapes, MultiDecoder.mlp_shapes参数。用于ImageBehavior.MLP, WorldModel.heads["reward"], WorldModel.heads["cont"]
+# ActionHead: 用于ImagBehavior.actor, 将特征向量转化为分布
+# GRUCell: 用于RSSM._cell, 是否norm由RSSM的cell参数决定
+# Conv2dSame: 用于ConvEncoder.layers[:], 保证输入输出的尺寸相同。 ConvDecoder.layers[:]是ConvTranspose2d实现的
+# ChLayerNorm: 用于ConvEncoder.layers[:], ConvDecoder.layers[:], 给BCHW形式的C维度做norm
 
 class RSSM(nn.Module):
     def __init__(
@@ -35,6 +46,7 @@ class RSSM(nn.Module):
         device=None,
     ):
         super(RSSM, self).__init__()
+        # 网络维度的三个组成部分(_stoch: 随机变量的维度, _deter: 确定性变量的维度, _hidden: 隐藏层的维度?)
         self._stoch = stoch
         self._deter = deter
         self._hidden = hidden
@@ -121,6 +133,8 @@ class RSSM(nn.Module):
                 requires_grad=True,
             )
 
+    # 考察_initial成员
+    # 如果是zeros，初始化state为全0，如果是learned，deter为tanh(W)
     def initial(self, batch_size):
         deter = torch.zeros(batch_size, self._deter).to(self._device)
         if self._discrete:
@@ -149,6 +163,9 @@ class RSSM(nn.Module):
         else:
             raise NotImplementedError(self._initial)
 
+    # 通过tools.static_scan调用self.obs_step
+    # 从embed，action，is_first中获取post和prior
+    # 所有的static_scan本质都是调用第一个参数表示的函数
     def observe(self, embed, action, is_first, state=None):
         swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
         if state is None:
@@ -169,8 +186,10 @@ class RSSM(nn.Module):
         prior = {k: swap(v) for k, v in prior.items()}
         return post, prior
 
+    # 通过tools.static_scan调用self.img_step
+    # 从action得出prior
     def imagine(self, action, state=None):
-        swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
+        swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape)))) # 除了0,1维度交换，其余维度都不变
         if state is None:
             state = self.initial(action.shape[0])
         assert isinstance(state, dict), state
@@ -181,6 +200,8 @@ class RSSM(nn.Module):
         prior = {k: swap(v) for k, v in prior.items()}
         return prior
 
+    # 拼合stoch的和deter的两部分状态
+    # TODO: state的格式是怎样的？
     def get_feat(self, state):
         stoch = state["stoch"]
         if self._discrete:
@@ -188,6 +209,8 @@ class RSSM(nn.Module):
             stoch = stoch.reshape(shape)
         return torch.cat([stoch, state["deter"]], -1)
 
+    # 获取某个量的可能分布？
+    # OneHotDist用于离散变量，Independent用于连续变量
     def get_dist(self, state, dtype=None):
         if self._discrete:
             logit = state["logit"]
@@ -201,6 +224,7 @@ class RSSM(nn.Module):
             )
         return dist
 
+    # 从state何action中获取post和prior
     def obs_step(self, prev_state, prev_action, embed, is_first, sample=True):
         # if shared is True, prior and post both use same networks(inp_layers, _img_out_layers, _ims_stat_layer)
         # otherwise, post use different network(_obs_out_layers) with prior[deter] and embed as inputs
@@ -218,11 +242,13 @@ class RSSM(nn.Module):
                 prev_state[key] = (
                     val * (1.0 - is_first_r) + init_state[key] * is_first_r
                 )
-
+        
+        # _shared:对先验和后验的估计使用相同的网络参数，即img_step
         prior = self.img_step(prev_state, prev_action, None, sample)
         if self._shared:
             post = self.img_step(prev_state, prev_action, embed, sample)
         else:
+            # _temp_post: 将prior的确定与随机部分拼起来取算post
             if self._temp_post:
                 x = torch.cat([prior["deter"], embed], -1)
             else:
@@ -230,6 +256,7 @@ class RSSM(nn.Module):
             # (batch_size, prior_deter + embed) -> (batch_size, hidden)
             x = self._obs_out_layers(x)
             # (batch_size, hidden) -> (batch_size, stoch, discrete_num)
+            # sample: 随机部分用采样，而不是用最大似然
             stats = self._suff_stats_layer("obs", x)
             if sample:
                 stoch = self.get_dist(stats).sample()
@@ -310,6 +337,9 @@ class RSSM(nn.Module):
             std = std + self._min_std
             return {"mean": mean, "std": std}
 
+    # kl_free is the minimum kl loss, 默认1.0, 不设最大值
+    # rep_loss是prior算sg做目标, rep_scale为系数, 默认0.1
+    # dyn_loss是post算prior做目标, dyn_scale为系数, 默认0.5
     def kl_loss(self, post, prior, free, dyn_scale, rep_scale):
         kld = torchd.kl.kl_divergence
         dist = lambda x: self.get_dist(x)
@@ -722,6 +752,7 @@ class MLP(nn.Module):
         raise NotImplementedError(dist)
 
 
+# 根据输入的特征features(见forward)生成不同类型(由dist)指定的分布
 class ActionHead(nn.Module):
     def __init__(
         self,
@@ -891,7 +922,7 @@ class ChLayerNorm(nn.Module):
         self.norm = torch.nn.LayerNorm(ch, eps=eps)
 
     def forward(self, x):
-        x = x.permute(0, 2, 3, 1)
+        x = x.permute(0, 2, 3, 1) # (B,C,H,W) -> (B,H,W,C)
         x = self.norm(x)
-        x = x.permute(0, 3, 1, 2)
+        x = x.permute(0, 3, 1, 2) # (B,H,W,C) -> (B,C,H,W)
         return x

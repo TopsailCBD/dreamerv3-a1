@@ -9,7 +9,12 @@ import tools
 
 to_np = lambda x: x.detach().cpu().numpy()
 
+# models.py定义了RewardEMA, WorldModel, ImagBehavior三个类。
+# RewardEMA: 用于ImagBehavior.reward_ema，需要reward_EMA参数开启
+# WorldModel: 用于实现: Dreamer.world_model
+# ImagBehavior: 用于实现: Dreamer.task_behavior
 
+# 用于ImagBehavior的reward计算，需要reward_EMA参数开启
 class RewardEMA(object):
     """running mean and std"""
 
@@ -28,6 +33,13 @@ class RewardEMA(object):
         return offset.detach(), scale.detach()
 
 
+# WorldModel的实现，其中
+# encoder: 用于将observation转换为embedding, 用MultiEncoder实现
+# dynamics: 用于将embedding转换为下一个embedding, 用RSSM实现
+# heads: 
+#   decoder: 用于将embedding转换为估计的observation, 用MultiDecoder实现
+#   reward: 用于将embedding转换为估计的reward, 用MLP实现
+#   cont: 用于将embedding转换为估计的是否停止的符号, 用MLP实现
 class WorldModel(nn.Module):
     def __init__(self, obs_space, act_space, step, config):
         super(WorldModel, self).__init__()
@@ -59,7 +71,7 @@ class WorldModel(nn.Module):
             self.embed_size,
             config.device,
         )
-        self.heads = nn.ModuleDict()
+        self.heads = nn.ModuleDict() # 就是字面意义，Module的字典，推测是专门用于实现multi-head的
         if config.dyn_discrete:
             feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
         else:
@@ -79,7 +91,7 @@ class WorldModel(nn.Module):
                 outscale=0.0,
                 device=config.device,
             )
-        else:
+        else: # 仅第二个参数: shape不同
             self.heads["reward"] = networks.MLP(
                 feat_size,  # pytorch version
                 [],
@@ -115,6 +127,10 @@ class WorldModel(nn.Module):
         )
         self._scales = dict(reward=config.reward_scale, cont=config.cont_scale)
 
+    # 每步调用一次，根据data计算model的loss（但还没到更新）
+    # return post
+    # return context: embed, feat, kl, postent（为feat的熵）
+    # return metrics: kl_loss的各项及参数
     def _train(self, data):
         # action (batch_size, batch_length, act_dim)
         # image (batch_size, batch_length, h, w, ch)
@@ -123,6 +139,7 @@ class WorldModel(nn.Module):
         data = self.preprocess(data)
 
         with tools.RequiresGrad(self):
+            # amp: Automatic Mixed Precision自动混合精度。在神经网络中某些操作在float16下更快，某些操作在float32下更快。混合精度可以加快计算速度，apex包就是干这个的。
             with torch.cuda.amp.autocast(self._use_amp):
                 embed = self.encoder(data)
                 post, prior = self.dynamics.observe(
@@ -131,9 +148,11 @@ class WorldModel(nn.Module):
                 kl_free = self._config.kl_free
                 dyn_scale = self._config.dyn_scale
                 rep_scale = self._config.rep_scale
+                # 获得dyn和rep两项
                 kl_loss, kl_value, dyn_loss, rep_loss = self.dynamics.kl_loss(
                     post, prior, kl_free, dyn_scale, rep_scale
                 )
+                # 获得pred里面x_hat, r, c三项（为什么一定是用log_prob?）
                 preds = {}
                 for name, head in self.heads.items():
                     grad_head = name in self._config.grad_heads
@@ -152,12 +171,12 @@ class WorldModel(nn.Module):
             metrics = self._model_opt(model_loss, self.parameters())
 
         metrics.update({f"{name}_loss": to_np(loss) for name, loss in losses.items()})
-        metrics["kl_free"] = kl_free
-        metrics["dyn_scale"] = dyn_scale
-        metrics["rep_scale"] = rep_scale
-        metrics["dyn_loss"] = to_np(dyn_loss)
-        metrics["rep_loss"] = to_np(rep_loss)
-        metrics["kl"] = to_np(torch.mean(kl_value))
+        metrics["kl_free"] = kl_free # config里
+        metrics["dyn_scale"] = dyn_scale # config里
+        metrics["rep_scale"] = rep_scale # config里
+        metrics["dyn_loss"] = to_np(dyn_loss) # kl_loss输出，dynamics项
+        metrics["rep_loss"] = to_np(rep_loss) # kl_loss输出，representation项
+        metrics["kl"] = to_np(torch.mean(kl_value)) # kl_loss输出，kl项
         with torch.cuda.amp.autocast(self._use_amp):
             metrics["prior_ent"] = to_np(
                 torch.mean(self.dynamics.get_dist(prior).entropy())
@@ -174,6 +193,13 @@ class WorldModel(nn.Module):
         post = {k: v.detach() for k, v in post.items()}
         return post, context, metrics
 
+    # 预处理，每次train和推理第一步调用，将obs进行包装，其中
+    # image，归一化
+    # discount若有，乘以config.discount
+    # is_first, is_terminal, 进行检查，必须有，确定含义为是否为第一帧/最后一帧（终止）
+    # cout, 1-is_terminal, 在这一过程中计算
+    # 所有量变为tensor上device
+    # TODO: 这时候才上device不慢吗？
     # this function is called during both rollout and training
     def preprocess(self, obs):
         obs = obs.copy()
@@ -190,16 +216,21 @@ class WorldModel(nn.Module):
         obs = {k: torch.Tensor(v).to(self._config.device) for k, v in obs.items()}
         return obs
 
+    # 根据输入的data输出预测的图像，并存储相关metric
+    # recon: reconstruction，decoder重构出的图像
+    # 相当于对decoder部分的test
     def video_pred(self, data):
         data = self.preprocess(data)
         embed = self.encoder(data)
 
+        # 取前6个样本的前5帧做嵌入表示，通过decoder预测第6帧
         states, _ = self.dynamics.observe(
             embed[:6, :5], data["action"][:6, :5], data["is_first"][:6, :5]
         )
         recon = self.heads["decoder"](self.dynamics.get_feat(states))["image"].mode()[
             :6
         ]
+        # reward输出的是预测的奖励的分布，取众数是指输出最可能的奖励值
         reward_post = self.heads["reward"](self.dynamics.get_feat(states)).mode()[:6]
         init = {k: v[:, -1] for k, v in states.items()}
         prior = self.dynamics.imagine(data["action"][:6, 5:], init)
@@ -214,6 +245,9 @@ class WorldModel(nn.Module):
         return torch.cat([truth, model, error], 2)
 
 
+# 用于实现: task_behavior
+# 调用: ActionHead
+# 是某种AC算法，actor=policy, value=critic, 从loss上来看最像SAC
 class ImagBehavior(nn.Module):
     def __init__(self, config, world_model, stop_grad_actor=True, reward=None):
         super(ImagBehavior, self).__init__()
@@ -288,6 +322,7 @@ class ImagBehavior(nn.Module):
         if self._config.reward_EMA:
             self.reward_ema = RewardEMA(device=self._config.device)
 
+    # 其中所有算梯度的地方都使用了torch.cuda.amp.autocast 是 PyTorch 提供的一个上下文管理器，用于自动执行混合精度计算。它可以将指定的代码块中的计算自动转换为低精度（如半精度）运算，以提高计算效率和减少内存占用。
     def _train(
         self,
         start,
@@ -302,6 +337,7 @@ class ImagBehavior(nn.Module):
         self._update_slow_target()
         metrics = {}
 
+        # 计算actor_loss
         with tools.RequiresGrad(self.actor):
             with torch.cuda.amp.autocast(self._use_amp):
                 imag_feat, imag_state, imag_action = self._imagine(
@@ -328,6 +364,7 @@ class ImagBehavior(nn.Module):
                 metrics.update(mets)
                 value_input = imag_feat
 
+        # 计算critic(value)_loss
         with tools.RequiresGrad(self.value):
             with torch.cuda.amp.autocast(self._use_amp):
                 value = self.value(value_input[:-1].detach())
@@ -344,6 +381,7 @@ class ImagBehavior(nn.Module):
                 # (time, batch, 1), (time, batch, 1) -> (1,)
                 value_loss = torch.mean(weights[:-1] * value_loss[:, :, None])
 
+        # 将一些值得记录的量记入metrics
         metrics.update(tools.tensorstats(value.mode(), "value"))
         metrics.update(tools.tensorstats(target, "target"))
         metrics.update(tools.tensorstats(reward, "imag_reward"))
@@ -356,11 +394,15 @@ class ImagBehavior(nn.Module):
         else:
             metrics.update(tools.tensorstats(imag_action, "imag_action"))
         metrics["actor_entropy"] = to_np(torch.mean(actor_ent))
+        
+        # 这里执行了loss.backward，对actor和value进行了更新
         with tools.RequiresGrad(self):
             metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
             metrics.update(self._value_opt(value_loss, self.value.parameters()))
         return imag_feat, imag_state, imag_action, weights, metrics
 
+    # 用world_model进行推理
+    # 从这个函数可以知道，imag是imagine，即world_model创造出的假想环境的意思
     def _imagine(self, start, policy, horizon, repeats=None):
         dynamics = self._world_model.dynamics
         if repeats:
@@ -368,6 +410,7 @@ class ImagBehavior(nn.Module):
         flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
         start = {k: flatten(v) for k, v in start.items()}
 
+        # 还是熟悉的通过static_scan进行调用，将每个输出变成iterable
         def step(prev, _):
             state, _, _ = prev
             feat = dynamics.get_feat(state)
@@ -385,6 +428,7 @@ class ImagBehavior(nn.Module):
 
         return feats, states, actions
 
+    # 在self._train中计算actor_loss部分调用
     def _compute_target(
         self, imag_feat, imag_state, imag_action, reward, actor_ent, state_ent
     ):
@@ -411,6 +455,7 @@ class ImagBehavior(nn.Module):
         ).detach()
         return target, weights, value[:-1]
 
+    # 在self._train中调用，字面意义
     def _compute_actor_loss(
         self,
         imag_feat,
