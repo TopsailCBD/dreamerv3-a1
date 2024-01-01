@@ -50,8 +50,10 @@ def train(args):
     train_cfg.runner.save_interval = 500
 
     env, env_cfg = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
-    ppo_runner, train_cfg = task_registry.make_teacher_runner(env=env, name=args.task, args=args, train_cfg=train_cfg)
-    ppo_runner.learn(num_learning_iterations=train_cfg.runner.max_iterations, init_at_random_ep_len=True)
+    # ppo_runner, train_cfg = task_registry.make_teacher_runner(env=env, name=args.task, args=args, train_cfg=train_cfg)
+    # ppo_runner.learn(num_learning_iterations=train_cfg.runner.max_iterations, init_at_random_ep_len=True)
+    dreamer_runner, train_cfg = task_registry.make_dreamer_runner(env=env, name=args.task, args=args, train_cfg=train_cfg)
+    dreamer_runner.learn()
 
 
 if __name__ == '__main__':

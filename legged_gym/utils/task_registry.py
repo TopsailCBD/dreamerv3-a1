@@ -29,6 +29,7 @@
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
 import os
+import pdb
 from datetime import datetime
 from typing import Tuple, Union
 import torch
@@ -241,8 +242,8 @@ class TaskRegistry():
             # log_dir = os.path.join(log_root, datetime.now().strftime('%b%d_%H-%M-%S') + '_' + train_cfg.runner.run_name)
             log_dir = os.path.join(log_root, train_cfg.runner.run_name)
         # print(train_cfg.runner_class_name)
-        train_cfg_dict = class_to_dict(train_cfg)
-        runner = DreamerRunner(env, train_cfg_dict, log_dir, device=args.rl_device)
+        # train_cfg_dict = class_to_dict(train_cfg)
+        runner = DreamerRunner(env, train_cfg, log_dir, device=args.rl_device)
         #save resume path before creating a new log_dir
         resume = train_cfg.runner.resume
         if resume:

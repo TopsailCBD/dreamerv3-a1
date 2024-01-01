@@ -3,6 +3,7 @@ import functools
 import os
 import pathlib
 import sys
+import pdb
 
 os.environ["MUJOCO_GL"] = "osmesa"
 
@@ -276,8 +277,9 @@ class DreamerRunner():
         if not log_dir:
             self.logdir = pathlib.Path(self.config.logdir).expanduser()
         else:
-            self.logdir = log_dir
-            
+            self.logdir = pathlib.Path(log_dir).expanduser()
+        
+        # pdb.set_trace()
         self.config.traindir = self.config.traindir or self.logdir / "train_eps"
         self.config.evaldir = self.config.evaldir or self.logdir / "eval_eps"
         self.config.steps //= self.config.action_repeat
@@ -375,7 +377,10 @@ class DreamerRunner():
         print("Simulate agent.")
 
 
-    def learn(self):
+    def learn(self, 
+            #   num_learning_iterations, 
+            #   init_at_random_ep_len=False
+              ):
         # === 2.0 构建可以训练的智能体dreamer ===
         train_dataset = make_dataset(self.train_eps, self.config)
         eval_dataset = make_dataset(self.eval_eps, self.config)
